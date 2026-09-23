@@ -67,11 +67,20 @@ const resolvedIncludePathCache: Map<string, string | undefined> = new Map();
 const reparseTimers: Map<string, NodeJS.Timeout> = new Map();
 const DEFAULT_REPARSE_DELAY = 300; // ms
 
+function unwrapConfig(cfg: any): any {
+    if (!cfg) return null;
+    if (Array.isArray(cfg)) {
+        return cfg.length > 0 ? unwrapConfig(cfg[0]) : null;
+    }
+    return cfg;
+}
+
 async function fetchConfiguration(scopeUri?: string): Promise<any> {
     if (!hasConfigurationCapability) return null;
     try {
         const item = scopeUri ? { scopeUri, section: 'pawnforge' } : { section: 'pawnforge' };
-        const pawnforgeConfig = await connection.workspace.getConfiguration(item);
+        const raw = await connection.workspace.getConfiguration(item);
+        const pawnforgeConfig = unwrapConfig(raw);
         if (pawnforgeConfig && typeof pawnforgeConfig === 'object' && Object.keys(pawnforgeConfig).length > 0) {
             return pawnforgeConfig;
         }
@@ -79,7 +88,8 @@ async function fetchConfiguration(scopeUri?: string): Promise<any> {
 
     try {
         const item = scopeUri ? { scopeUri, section: 'amxxpawn' } : { section: 'amxxpawn' };
-        const amxxpawnConfig = await connection.workspace.getConfiguration(item);
+        const raw = await connection.workspace.getConfiguration(item);
+        const amxxpawnConfig = unwrapConfig(raw);
         if (amxxpawnConfig && typeof amxxpawnConfig === 'object' && Object.keys(amxxpawnConfig).length > 0) {
             return amxxpawnConfig;
         }
@@ -87,7 +97,8 @@ async function fetchConfiguration(scopeUri?: string): Promise<any> {
 
     try {
         const item = scopeUri ? { scopeUri, section: '' } : { section: '' };
-        const rootConfig: any = await connection.workspace.getConfiguration(item);
+        const raw = await connection.workspace.getConfiguration(item);
+        const rootConfig: any = unwrapConfig(raw);
         if (rootConfig && typeof rootConfig === 'object') {
             return rootConfig.pawnforge || rootConfig.amxxpawn || rootConfig;
         }
@@ -104,11 +115,12 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
         if (params.initializationOptions.globalStoragePath) {
             globalStoragePath = params.initializationOptions.globalStoragePath;
         }
-        const initSettings = params.initializationOptions.settings || params.initializationOptions;
+        const initSettings = unwrapConfig(params.initializationOptions.settings || params.initializationOptions);
         if (initSettings && typeof initSettings === 'object') {
-            const found = initSettings.pawnforge || initSettings.amxxpawn || initSettings;
+            const found = unwrapConfig(initSettings.pawnforge || initSettings.amxxpawn || initSettings);
             if (found && (found.includePaths || found.compiler || found.language)) {
                 syncedSettings = found;
+                connection.console.log(`[pawnforge] Initialization settings loaded. Include paths: ${JSON.stringify(getRawIncludePaths())}`);
             }
         }
     }
@@ -147,10 +159,10 @@ connection.onInitialized(() => {
 connection.onDidChangeConfiguration(async (change) => {
     let loaded = await fetchConfiguration();
     if (!loaded && change?.settings) {
-        loaded = change.settings.pawnforge || change.settings.amxxpawn || change.settings;
+        loaded = unwrapConfig(change.settings.pawnforge || change.settings.amxxpawn || change.settings);
     }
     if (loaded) {
-        syncedSettings = loaded;
+        syncedSettings = unwrapConfig(loaded);
         connection.console.log(`[pawnforge] Configuration updated. Include paths: ${JSON.stringify(getRawIncludePaths())}`);
     }
     // Limpa cache de includes e diretórios quando configuração muda
@@ -240,11 +252,10 @@ connection.onDocumentLinks((params: DocumentLinkParams): DocumentLink[] | null =
 });
 
 async function validateAndReparse(document: TextDocument): Promise<void> {
-    if (!syncedSettings) {
-        const loaded = await fetchConfiguration(document.uri);
-        if (loaded) {
-            syncedSettings = loaded;
-        }
+    const loaded = await fetchConfiguration(document.uri);
+    if (loaded) {
+        syncedSettings = unwrapConfig(loaded);
+        connection.console.log(`[pawnforge] Reparse configuration synced. Include paths: ${JSON.stringify(getRawIncludePaths())}`);
     }
     doReparse(document);
 }
@@ -348,7 +359,10 @@ connection.onDocumentSymbol((params): SymbolInformation[] | null => {
 });
 
 function getRawIncludePaths(): string[] {
-    const raw: any = syncedSettings || {};
+    let raw: any = syncedSettings || {};
+    if (Array.isArray(raw)) {
+        raw = raw[0] || {};
+    }
     const globalPaths = raw.compiler?.globalIncludePaths || raw['compiler.globalIncludePaths'] || raw.globalIncludePaths || raw['pawnforge.compiler.globalIncludePaths'] || [];
     const localPaths = raw.compiler?.includePaths || raw['compiler.includePaths'] || raw.includePaths || raw['pawnforge.compiler.includePaths'] || raw['pawnforge.includePaths'] || [];
     return [...globalPaths, ...localPaths];
