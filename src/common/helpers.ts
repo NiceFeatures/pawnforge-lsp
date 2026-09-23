@@ -185,13 +185,30 @@ export function resolveIncludeDirectories(
         if (!resolvedPath) continue;
 
         if (!rawPath.includes('*')) {
-            // Explicit path: keep if it exists and is a directory
-            if (FS.existsSync(resolvedPath)) {
-                try {
-                    if (FS.statSync(resolvedPath).isDirectory()) {
-                        resultDirs.push(Path.normalize(resolvedPath));
-                    }
-                } catch { /* ignore */ }
+            // Check absolute candidate paths or relative to workspace / file directory
+            const candidatePaths: string[] = [];
+            if (Path.isAbsolute(resolvedPath)) {
+                candidatePaths.push(resolvedPath);
+            } else {
+                if (workspacePath) {
+                    candidatePaths.push(Path.resolve(workspacePath, resolvedPath));
+                }
+                if (filePath) {
+                    const fileDir = Path.win32.dirname(filePath);
+                    candidatePaths.push(Path.resolve(fileDir, resolvedPath));
+                }
+                candidatePaths.push(Path.resolve(resolvedPath));
+            }
+
+            for (const candidate of candidatePaths) {
+                if (FS.existsSync(candidate)) {
+                    try {
+                        if (FS.statSync(candidate).isDirectory()) {
+                            resultDirs.push(Path.normalize(candidate));
+                            break;
+                        }
+                    } catch { /* ignore */ }
+                }
             }
         } else {
             // Wildcard pattern: expand and filter directories containing .inc files (directly or in subdirectories)

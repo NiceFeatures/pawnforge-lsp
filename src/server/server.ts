@@ -427,6 +427,14 @@ function resolveIncludePath(filename: string, documentPath: string, localTo: str
         finalIncludePaths.unshift(localTo);
     }
 
+    if (documentPath) {
+        const docDir = Path.win32.dirname(documentPath);
+        const localInclude = Path.join(docDir, 'include');
+        if (FS.existsSync(localInclude) && !finalIncludePaths.includes(localInclude)) {
+            finalIncludePaths.unshift(localInclude);
+        }
+    }
+
     if (globalStoragePath) {
         if (cachedAutoIncludePath && FS.existsSync(cachedAutoIncludePath)) {
             finalIncludePaths.push(cachedAutoIncludePath);
