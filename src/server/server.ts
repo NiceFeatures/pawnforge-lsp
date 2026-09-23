@@ -255,6 +255,9 @@ async function validateAndReparse(document: TextDocument): Promise<void> {
     const loaded = await fetchConfiguration(document.uri);
     if (loaded) {
         syncedSettings = unwrapConfig(loaded);
+        includeContentCache.clear();
+        cachedResolvedIncludeDirs.clear();
+        resolvedIncludePathCache.clear();
         connection.console.log(`[pawnforge] Reparse configuration synced. Include paths: ${JSON.stringify(getRawIncludePaths())}`);
     }
     doReparse(document);
@@ -363,9 +366,34 @@ function getRawIncludePaths(): string[] {
     if (Array.isArray(raw)) {
         raw = raw[0] || {};
     }
-    const globalPaths = raw.compiler?.globalIncludePaths || raw['compiler.globalIncludePaths'] || raw.globalIncludePaths || raw['pawnforge.compiler.globalIncludePaths'] || [];
-    const localPaths = raw.compiler?.includePaths || raw['compiler.includePaths'] || raw.includePaths || raw['pawnforge.compiler.includePaths'] || raw['pawnforge.includePaths'] || [];
-    return [...globalPaths, ...localPaths];
+    const collect = (arr: any): string[] => {
+        if (Array.isArray(arr)) {
+            return arr.filter((x: any) => typeof x === 'string' && x.trim().length > 0);
+        }
+        return [];
+    };
+
+    const compilerGlobal = collect(raw.compiler?.globalIncludePaths || raw['compiler.globalIncludePaths']);
+    const rootGlobal = collect(raw.globalIncludePaths || raw['pawnforge.compiler.globalIncludePaths'] || raw['pawnforge.globalIncludePaths']);
+    const globalPaths = [...compilerGlobal, ...rootGlobal];
+
+    const compilerLocal = collect(raw.compiler?.includePaths || raw['compiler.includePaths']);
+    const rootLocal = collect(raw.includePaths || raw['pawnforge.compiler.includePaths'] || raw['pawnforge.includePaths']);
+    const localPaths = [...compilerLocal, ...rootLocal];
+
+    const autoCompilerIncludes: string[] = [];
+    const execPath = raw.compiler?.executablePath || raw['compiler.executablePath'];
+    if (execPath && typeof execPath === 'string') {
+        try {
+            const compDir = Path.dirname(execPath);
+            const compInc = Path.join(compDir, 'include');
+            if (FS.existsSync(compInc)) {
+                autoCompilerIncludes.push(compInc);
+            }
+        } catch (_) {}
+    }
+
+    return [...new Set([...globalPaths, ...localPaths, ...autoCompilerIncludes])];
 }
 
 function getResolvedIncludeDirs(documentPath?: string): string[] {
