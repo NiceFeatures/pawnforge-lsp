@@ -1,0 +1,659 @@
+'use strict';
+
+import * as FS from 'fs';
+import * as Path from 'path';
+import {
+    createConnection,
+    TextDocuments,
+    ProposedFeatures,
+    InitializeParams,
+    CompletionItem,
+    TextDocumentPositionParams,
+    TextDocumentSyncKind,
+    InitializeResult,
+    Definition,
+    SignatureHelp,
+    Hover,
+    DocumentLink,
+    Location,
+    SymbolInformation,
+    SymbolKind,
+    Diagnostic,
+    DiagnosticSeverity,
+    DidChangeConfigurationNotification,
+    DocumentLinkParams,
+    Range,
+    FileChangeType,
+    SemanticTokensBuilder,
+    ReferenceParams,
+    RenameParams,
+    PrepareRenameParams,
+    WorkspaceEdit,
+    TextEdit,
+    DocumentHighlight,
+    DocumentHighlightParams,
+    FoldingRange,
+    FoldingRangeParams,
+    WorkspaceSymbolParams
+} from 'vscode-languageserver/node';
+import { TextDocument } from 'vscode-languageserver-textdocument';
+import { URI } from 'vscode-uri';
+import * as Settings from '../common/settings-types';
+import * as Parser from './parser';
+import * as Types from './types';
+import * as DM from './dependency-manager';
+import * as Helpers from './helpers';
+import { resolvePathPattern, resolvePathVariables, resolveIncludeDirectories, findWorkspaceFiles } from '../common/helpers';
+
+const connection = createConnection(ProposedFeatures.all);
+const documentsManager = new TextDocuments(TextDocument);
+
+let syncedSettings: Settings.SyncedSettings;
+let dependencyManager: DM.FileDependencyManager = new DM.FileDependencyManager();
+let documentsData: Map<string, Types.DocumentData> = new Map();
+let dependenciesData: Map<DM.FileDependency, Types.DocumentData> = new Map();
+let workspaceRoot: string | null = null;
+let cachedWorkspaceFiles: string[] | null = null;
+let hasConfigurationCapability: boolean = false;
+let globalStoragePath: string | null = null;
+let cachedAutoIncludePath: string | null = null;
+
+// --- Fix #2: Cache de conteúdo de includes e diretórios resolvidos ---
+const includeContentCache: Map<string, string> = new Map();
+const cachedResolvedIncludeDirs: Map<string, string[]> = new Map();
+const resolvedIncludePathCache: Map<string, string | undefined> = new Map();
+
+// --- Fix #3: Debounce timers por documento ---
+const reparseTimers: Map<string, NodeJS.Timeout> = new Map();
+const DEFAULT_REPARSE_DELAY = 300; // ms
+
+connection.onInitialize((params: InitializeParams): InitializeResult => {
+    workspaceRoot = params.rootUri || (params.workspaceFolders && params.workspaceFolders.length > 0 ? params.workspaceFolders[0].uri : null);
+    hasConfigurationCapability = !!(params.capabilities.workspace && !!params.capabilities.workspace.configuration);
+
+    if (params.initializationOptions && params.initializationOptions.globalStoragePath) {
+        globalStoragePath = params.initializationOptions.globalStoragePath;
+    }
+
+    return {
+        capabilities: {
+            textDocumentSync: TextDocumentSyncKind.Incremental,
+            documentLinkProvider: { resolveProvider: false },
+            definitionProvider: true,
+            signatureHelpProvider: { triggerCharacters: ['(', ','] },
+            documentSymbolProvider: true,
+            workspaceSymbolProvider: true,
+            documentHighlightProvider: true,
+            foldingRangeProvider: true,
+            completionProvider: { resolveProvider: false, triggerCharacters: ['(', ',', '=', '@', '#'] },
+            hoverProvider: true,
+            referencesProvider: true,
+            renameProvider: { prepareProvider: true },
+            semanticTokensProvider: {
+                full: true,
+                legend: {
+                    tokenTypes: [...Types.SemanticTokenTypes],
+                    tokenModifiers: [...Types.SemanticTokenModifiers]
+                }
+            }
+        }
+    };
+});
+
+connection.onInitialized(() => {
+    if (hasConfigurationCapability) {
+        connection.client.register(DidChangeConfigurationNotification.type, undefined);
+    }
+});
+
+connection.onDidChangeConfiguration(async () => {
+    if (hasConfigurationCapability) {
+        try {
+            syncedSettings = await connection.workspace.getConfiguration('amxxpawn');
+        } catch (e) {
+            connection.console.error(`Error fetching configuration: ${e}`);
+            syncedSettings = { compiler: {} as Settings.CompilerSettings, language: {} as Settings.LanguageSettings };
+        }
+    }
+    // Limpa cache de includes e diretórios quando configuração muda
+    includeContentCache.clear();
+    cachedResolvedIncludeDirs.clear();
+    resolvedIncludePathCache.clear();
+    cachedWorkspaceFiles = null;
+    documentsData.forEach(d => { d.cachedSymbols = null; });
+    dependenciesData.forEach(d => { d.cachedSymbols = null; });
+    documentsManager.all().forEach((doc) => scheduleReparse(doc));
+});
+
+connection.onNotification('amxxpawn/reparseAll', () => {
+    cachedAutoIncludePath = null;
+    includeContentCache.clear();
+    cachedResolvedIncludeDirs.clear();
+    resolvedIncludePathCache.clear();
+    cachedWorkspaceFiles = null;
+    documentsData.forEach(d => { d.cachedSymbols = null; });
+    dependenciesData.forEach(d => { d.cachedSymbols = null; });
+    documentsManager.all().forEach((doc) => scheduleReparse(doc));
+});
+
+// --- Fix #2: Handler de mudanças em arquivos do workspace ---
+// Quando um .inc é salvo/modificado externamente, invalida o cache e re-parseia
+connection.onDidChangeWatchedFiles((params) => {
+    let needsReparse = false;
+    cachedResolvedIncludeDirs.clear();
+    resolvedIncludePathCache.clear();
+    cachedWorkspaceFiles = null;
+
+    for (const change of params.changes) {
+        const changedUri = change.uri;
+
+        // Invalida o cache do arquivo modificado
+        if (includeContentCache.has(changedUri)) {
+            includeContentCache.delete(changedUri);
+            needsReparse = true;
+        }
+
+        // Se o arquivo foi deletado, limpa dependências dele
+        if (change.type === FileChangeType.Deleted) {
+            const dep = dependencyManager.getDependency(changedUri);
+            if (dep) {
+                const depData = dependenciesData.get(dep);
+                if (depData) {
+                    Helpers.removeDependencies(depData.dependencies, dependencyManager, dependenciesData);
+                }
+                dependenciesData.delete(dep);
+                needsReparse = true;
+            }
+        }
+
+        // Se um .inc foi modificado, força re-parse das dependências
+        if (change.type === FileChangeType.Changed) {
+            const dep = dependencyManager.getDependency(changedUri);
+            if (dep) {
+                // Remove dados antigos para forçar re-parse
+                dependenciesData.delete(dep);
+                needsReparse = true;
+            }
+        }
+    }
+
+    if (needsReparse) {
+        documentsData.forEach(d => { d.cachedSymbols = null; });
+        dependenciesData.forEach(d => { d.cachedSymbols = null; });
+        documentsManager.all().forEach((doc) => scheduleReparse(doc));
+    }
+});
+
+connection.onDocumentLinks((params: DocumentLinkParams): DocumentLink[] | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+    const data = documentsData.get(document.uri);
+    if (!data) return null;
+
+    if (syncedSettings?.language?.webApiLinks === true) {
+        return data.resolvedInclusions.map(inc => {
+            let filename = inc.descriptor.filename.replace(/\.inc$/, '');
+            const range = Range.create(inc.descriptor.start, inc.descriptor.end);
+            return DocumentLink.create(range, `https://amxx-bg.info/api/${filename}`);
+        });
+    }
+
+    return null;
+});
+
+async function validateAndReparse(document: TextDocument): Promise<void> {
+    if (hasConfigurationCapability && !syncedSettings) {
+        try {
+            syncedSettings = await connection.workspace.getConfiguration({
+                scopeUri: document.uri,
+                section: 'amxxpawn'
+            });
+        } catch (e) {
+            connection.console.error(`Could not fetch configuration: ${e}`);
+        }
+    }
+    doReparse(document);
+}
+
+// --- Fix #3: Debounce — agenda reparse com delay configurável ---
+function scheduleReparse(document: TextDocument) {
+    const uri = document.uri;
+
+    // Cancela timer anterior se existir
+    const existingTimer = reparseTimers.get(uri);
+    if (existingTimer) {
+        clearTimeout(existingTimer);
+    }
+
+    const delay = (syncedSettings?.language?.reparseInterval !== undefined && syncedSettings.language.reparseInterval >= 0)
+        ? syncedSettings.language.reparseInterval
+        : DEFAULT_REPARSE_DELAY;
+
+    // Agenda novo reparse com delay
+    const timer = setTimeout(() => {
+        reparseTimers.delete(uri);
+        validateAndReparse(document).catch(e => {
+            connection.console.error(`Error during reparse for ${uri}: ${e}`);
+        });
+    }, delay);
+
+    reparseTimers.set(uri, timer);
+}
+
+function doReparse(document: TextDocument) {
+    let data = documentsData.get(document.uri);
+    if (data === undefined) {
+        data = new Types.DocumentData(document.uri);
+        documentsData.set(document.uri, data);
+    }
+
+    const diagnostics: Map<string, Diagnostic[]> = new Map();
+    parseFile(URI.parse(document.uri), document.getText(), data, diagnostics, false);
+
+    // --- Fix #4: Limpa dependências órfãs ---
+    Helpers.removeUnreachableDependencies(
+        documentsManager.all()
+            .map(doc => documentsData.get(doc.uri))
+            .filter((d): d is Types.DocumentData => d !== undefined),
+        dependencyManager,
+        dependenciesData
+    );
+
+    diagnostics.forEach((ds, uri) => connection.sendDiagnostics({ uri: uri, diagnostics: ds }));
+
+    // Force VS Code to refresh semantic tokens now that parsing is done
+    if (connection.languages && connection.languages.semanticTokens) {
+        connection.languages.semanticTokens.refresh();
+    }
+}
+
+connection.onDefinition((params: TextDocumentPositionParams): Definition | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+    const data = documentsData.get(document.uri);
+    if (!data) return null;
+
+    function inclusionLocation(inclusions: Types.ResolvedInclusion[]): Location | null {
+        for (const inc of inclusions) {
+            if (params.position.line === inc.descriptor.start.line &&
+                params.position.character > inc.descriptor.start.character &&
+                params.position.character < inc.descriptor.end.character) {
+                return Location.create(inc.uri, { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } });
+            }
+        }
+        return null;
+    };
+
+    const location = inclusionLocation(data.resolvedInclusions);
+    if (location) return location;
+
+    return Parser.doDefinition(document.getText(), params.position, data, dependenciesData);
+});
+
+connection.onSignatureHelp((params: TextDocumentPositionParams): SignatureHelp | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+    const data = documentsData.get(document.uri);
+    if (!data) return null;
+
+    const symbols = Helpers.getSymbols(data, dependenciesData);
+    return Parser.doSignatures(document.getText(), params.position, symbols.callables, symbols.callablesMap);
+});
+
+connection.onDocumentSymbol((params): SymbolInformation[] | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+    const data = documentsData.get(document.uri);
+    if (!data) return null;
+
+    return data.callables.map<SymbolInformation>((clb) => ({
+        name: clb.identifier,
+        location: { range: { start: clb.start, end: clb.end }, uri: params.textDocument.uri },
+        kind: SymbolKind.Function
+    }));
+});
+
+function getRawIncludePaths(): string[] {
+    const globalPaths = syncedSettings?.compiler?.globalIncludePaths || syncedSettings?.globalIncludePaths || [];
+    const localPaths = syncedSettings?.compiler?.includePaths || syncedSettings?.includePaths || [];
+    return [...globalPaths, ...localPaths];
+}
+
+function getResolvedIncludeDirs(documentPath?: string): string[] {
+    const workspacePath = workspaceRoot ? URI.parse(workspaceRoot).fsPath : undefined;
+    const cacheKey = documentPath || '__global__';
+    const cached = cachedResolvedIncludeDirs.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const rawPaths = getRawIncludePaths();
+    const finalDirs = resolveIncludeDirectories(rawPaths, workspacePath, documentPath);
+    cachedResolvedIncludeDirs.set(cacheKey, finalDirs);
+    return finalDirs;
+}
+
+connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+    const data = documentsData.get(document.uri);
+    if (!data) return null;
+
+    const documentPath = URI.parse(document.uri).fsPath;
+    const finalIncludePaths = getResolvedIncludeDirs(documentPath);
+
+    return Parser.doCompletions(connection, document.getText(), params.position, data, dependenciesData, finalIncludePaths);
+});
+
+connection.onHover((params: TextDocumentPositionParams): Hover | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+    const data = documentsData.get(document.uri);
+    if (!data) return null;
+
+    return Parser.doHover(document.getText(), params.position, data, dependenciesData);
+});
+
+documentsManager.onDidOpen((event) => {
+    validateAndReparse(event.document);
+});
+
+documentsManager.onDidClose((event) => {
+    // Cancela timer de debounce pendente
+    const timer = reparseTimers.get(event.document.uri);
+    if (timer) {
+        clearTimeout(timer);
+        reparseTimers.delete(event.document.uri);
+    }
+
+    const docData = documentsData.get(event.document.uri);
+    if (docData) {
+        Helpers.removeDependencies(docData.dependencies, dependencyManager, dependenciesData);
+        const allOpenDocsData = documentsManager.all()
+            .map(doc => documentsData.get(doc.uri))
+            .filter((d): d is Types.DocumentData => d !== undefined);
+        Helpers.removeUnreachableDependencies(allOpenDocsData, dependencyManager, dependenciesData);
+        documentsData.delete(event.document.uri);
+    }
+});
+
+// --- Fix #3: onDidChangeContent usa debounce ---
+documentsManager.onDidChangeContent((change) => {
+    scheduleReparse(change.document);
+});
+
+function resolveIncludePath(filename: string, documentPath: string, localTo: string | undefined): string | undefined {
+    const cacheKey = `${filename}|${documentPath}|${localTo || ''}`;
+    if (resolvedIncludePathCache.has(cacheKey)) {
+        return resolvedIncludePathCache.get(cacheKey);
+    }
+
+    const finalIncludePaths = [...getResolvedIncludeDirs(documentPath)];
+
+    if (localTo !== undefined) {
+        finalIncludePaths.unshift(localTo);
+    }
+
+    if (globalStoragePath) {
+        if (cachedAutoIncludePath && FS.existsSync(cachedAutoIncludePath)) {
+            finalIncludePaths.push(cachedAutoIncludePath);
+        } else {
+            const compilerDir = Path.join(globalStoragePath, 'compiler');
+            const directInclude = Path.join(compilerDir, 'include');
+            if (FS.existsSync(directInclude)) {
+                cachedAutoIncludePath = directInclude;
+                finalIncludePaths.push(directInclude);
+            } else {
+                try {
+                    const entries = FS.readdirSync(compilerDir, { withFileTypes: true });
+                    for (const entry of entries) {
+                        if (entry.isDirectory()) {
+                            const nestedInclude = Path.join(compilerDir, entry.name, 'include');
+                            if (FS.existsSync(nestedInclude)) {
+                                cachedAutoIncludePath = nestedInclude;
+                                finalIncludePaths.push(nestedInclude);
+                                break;
+                            }
+                        }
+                    }
+                } catch { /* ignore */ }
+            }
+        }
+    }
+
+    for (const includePath of finalIncludePaths) {
+        if (!includePath) continue;
+        const fullPath = Path.join(includePath, filename);
+        if (FS.existsSync(fullPath)) {
+            const resolvedUri = URI.file(fullPath).toString();
+            resolvedIncludePathCache.set(cacheKey, resolvedUri);
+            return resolvedUri;
+        }
+        const fullPathWithExt = Path.join(includePath, filename + '.inc');
+        if (FS.existsSync(fullPathWithExt)) {
+            const resolvedUri = URI.file(fullPathWithExt).toString();
+            resolvedIncludePathCache.set(cacheKey, resolvedUri);
+            return resolvedUri;
+        }
+    }
+
+    resolvedIncludePathCache.set(cacheKey, undefined);
+    return undefined;
+}
+
+const MAX_INCLUDE_CACHE_SIZE = 200;
+
+// --- Fix #2: Função auxiliar para ler include com cache ---
+function readIncludeContent(uri: string): string | null {
+    // Verifica se já está no cache
+    const cached = includeContentCache.get(uri);
+    if (cached !== undefined) {
+        return cached;
+    }
+
+    // Lê do disco e armazena no cache com limite de tamanho
+    try {
+        const fsPath = URI.parse(uri).fsPath;
+        const content = FS.readFileSync(fsPath).toString();
+        if (includeContentCache.size >= MAX_INCLUDE_CACHE_SIZE) {
+            const firstKey = includeContentCache.keys().next().value;
+            if (firstKey !== undefined) {
+                includeContentCache.delete(firstKey);
+            }
+        }
+        includeContentCache.set(uri, content);
+        return content;
+    } catch (e) {
+        connection.console.error(`Failed to read file ${uri}: ${e}`);
+        return null;
+    }
+}
+
+function parseFile(fileUri: URI, content: string, data: Types.DocumentData, diagnostics: Map<string, Diagnostic[]>, isDependency: boolean) {
+    let myDiagnostics: Diagnostic[] = [];
+    diagnostics.set(data.uri, myDiagnostics);
+    const dependencies: DM.FileDependency[] = [];
+
+    const results = Parser.parse(fileUri, content, isDependency);
+
+    data.resolvedInclusions = [];
+    myDiagnostics.push(...results.diagnostics);
+
+    const documentPath = fileUri.fsPath;
+
+    results.headerInclusions.forEach((header) => {
+        const localTo = header.isLocal ? Path.dirname(documentPath) : undefined;
+        const resolvedUri = resolveIncludePath(header.filename, documentPath, localTo);
+
+        if (resolvedUri === data.uri) return;
+
+        if (resolvedUri !== undefined) {
+            let dependency = dependencyManager.getDependency(resolvedUri);
+            if (dependency === undefined) {
+                dependency = dependencyManager.addReference(resolvedUri);
+            } else if (!data.dependencies.includes(dependency) && !dependencies.includes(dependency)) {
+                dependencyManager.addReference(dependency.uri);
+            }
+            if (!dependencies.includes(dependency)) {
+                dependencies.push(dependency);
+            }
+
+            let depData = dependenciesData.get(dependency);
+            if (depData === undefined) {
+                depData = new Types.DocumentData(dependency.uri);
+                dependenciesData.set(dependency, depData);
+
+                // --- Fix #2: Usa cache em vez de readFileSync direto ---
+                const fileContent = readIncludeContent(dependency.uri);
+                if (fileContent !== null) {
+                    const dependencyUri = URI.parse(dependency.uri);
+                    parseFile(dependencyUri, fileContent, depData, diagnostics, true);
+                }
+            }
+            data.resolvedInclusions.push({ uri: resolvedUri, descriptor: header });
+        } else {
+            myDiagnostics.push({
+                message: `Couldn't resolve include path '${header.filename}'. Check compiler include paths.`,
+                severity: header.isSilent ? DiagnosticSeverity.Information : DiagnosticSeverity.Error,
+                source: 'amxxpawn',
+                range: { start: header.start, end: header.end }
+            });
+        }
+    });
+
+    const oldDeps = data.dependencies.filter((dep) => !dependencies.includes(dep));
+    Helpers.removeDependencies(oldDeps, dependencyManager, dependenciesData);
+    data.dependencies = dependencies;
+
+    data.callables = results.callables;
+    data.values = results.values;
+    data.constants = results.constants;
+    data.semanticTokens = results.semanticTokens;
+    data.localVariables = results.localVariables;
+    data.cachedSymbols = null;
+    documentsData.forEach(d => { d.cachedSymbols = null; });
+}
+
+// --- Semantic Tokens Provider ---
+connection.languages.semanticTokens.on((params) => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return { data: [] };
+
+    const data = documentsData.get(document.uri);
+    if (!data) return { data: [] };
+
+    const builder = new SemanticTokensBuilder();
+
+    const usageTokens = Parser.getUsageTokens(document.getText(), data, dependenciesData);
+    const allTokens = [...data.semanticTokens, ...usageTokens];
+
+    // Tokens devem ser ordenados por posição (linha, coluna)
+    const sortedTokens = allTokens.sort((a, b) => {
+        if (a.line !== b.line) return a.line - b.line;
+        return a.char - b.char;
+    });
+
+    for (const token of sortedTokens) {
+        builder.push(
+            token.line,
+            token.char,
+            token.length,
+            token.tokenType,
+            token.tokenModifiers
+        );
+    }
+
+    return builder.build();
+});
+
+// --- Find References Provider ---
+connection.onReferences((params: ReferenceParams): Location[] => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return [];
+    const data = documentsData.get(document.uri);
+    if (!data) return [];
+
+    // Obter arquivos do workspace se disponível
+    const workspacePath = workspaceRoot ? URI.parse(workspaceRoot).fsPath : undefined;
+    if (cachedWorkspaceFiles === null && workspacePath) {
+        cachedWorkspaceFiles = findWorkspaceFiles(workspacePath);
+    }
+
+    const candidateUris: string[] = [];
+    if (cachedWorkspaceFiles) {
+        for (const filePath of cachedWorkspaceFiles) {
+            candidateUris.push(URI.file(filePath).toString());
+        }
+    }
+    // Adiciona outros documentos abertos
+    for (const openDoc of documentsManager.all()) {
+        if (!candidateUris.includes(openDoc.uri)) {
+            candidateUris.push(openDoc.uri);
+        }
+    }
+
+    // Função unificada para ler conteúdo: documento aberto tem prioridade (texto em edição)
+    const getFileContent = (uri: string): string | null => {
+        const openDoc = documentsManager.get(uri);
+        if (openDoc) {
+            return openDoc.getText();
+        }
+        return readIncludeContent(uri);
+    };
+
+    return Parser.doReferences(
+        document.getText(),
+        params.position,
+        document.uri,
+        data,
+        dependenciesData,
+        getFileContent,
+        candidateUris
+    );
+});
+
+// --- Rename Provider ---
+connection.onPrepareRename((params: PrepareRenameParams) => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+
+    return Parser.doPrepareRename(document.getText(), params.position);
+});
+
+connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+
+    const edits = Parser.doRename(document.getText(), params.position, params.newName, document.uri);
+    if (edits.length === 0) return null;
+
+    return {
+        changes: {
+            [document.uri]: edits
+        }
+    };
+});
+
+// --- Document Highlight Provider ---
+connection.onDocumentHighlight((params: DocumentHighlightParams): DocumentHighlight[] | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+    const data = documentsData.get(document.uri);
+    if (!data) return null;
+
+    return Parser.doDocumentHighlight(document.getText(), params.position, data, dependenciesData);
+});
+
+// --- Folding Ranges Provider ---
+connection.onFoldingRanges((params: FoldingRangeParams): FoldingRange[] | null => {
+    const document = documentsManager.get(params.textDocument.uri);
+    if (!document) return null;
+
+    return Parser.doFoldingRanges(document.getText());
+});
+
+// --- Workspace Symbols Provider ---
+connection.onWorkspaceSymbol((params: WorkspaceSymbolParams): SymbolInformation[] | null => {
+    return Parser.doWorkspaceSymbols(params.query, documentsData, dependenciesData);
+});
+
+documentsManager.listen(connection);
+connection.listen();

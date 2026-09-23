@@ -1,0 +1,45 @@
+name: Release PawnForge Standalone LSP
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build JS bundle
+        run: npm run build
+
+      - name: Compile Standalone Binaries
+        run: |
+          mkdir -p bin
+          bun build --compile --minify src/cli.ts --outfile bin/pawnforge-lsp.exe
+          bun build --compile --minify --target=bun-linux-x64 src/cli.ts --outfile bin/pawnforge-lsp-linux
+
+      - name: Create Release and Upload Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/pawnforge-lsp.exe
+            bin/pawnforge-lsp-linux
+          generate_release_notes: true

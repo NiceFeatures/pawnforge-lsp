@@ -1,0 +1,46 @@
+{
+  "name": "pawnforge-lsp",
+  "version": "1.0.0",
+  "description": "Standalone Language Server Protocol (LSP) for AMX Mod X Pawn (Sublime Text, Notepad++, Neovim, etc.)",
+  "main": "dist/server.js",
+  "bin": {
+    "pawnforge-lsp": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "node esbuild.js --production",
+    "build:dev": "node esbuild.js",
+    "compile:win": "bun build --compile --minify src/cli.ts --outfile bin/pawnforge-lsp.exe",
+    "compile:linux": "bun build --compile --minify --target=bun-linux-x64 src/cli.ts --outfile bin/pawnforge-lsp-linux",
+    "test": "node dist/cli.js --version"
+  },
+  "keywords": [
+    "amxmodx",
+    "amxx",
+    "pawn",
+    "lsp",
+    "language-server",
+    "sublime-text",
+    "notepad-plus-plus",
+    "neovim"
+  ],
+  "author": "iceeedR",
+  "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NiceFeatures/pawnforge-lsp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NiceFeatures/pawnforge-lsp/issues"
+  },
+  "homepage": "https://github.com/NiceFeatures/pawnforge-lsp#readme",
+  "dependencies": {
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.8",
+    "vscode-uri": "^3.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "esbuild": "^0.27.4",
+    "typescript": "^5.0.0"
+  }
+}

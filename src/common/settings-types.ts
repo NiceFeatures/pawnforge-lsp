@@ -1,0 +1,25 @@
+export interface CompilerSettings {
+    executablePath: string;
+    globalIncludePaths?: string[];
+    includePaths: string[];
+    options: string[];
+    outputType: string;
+    outputPath: string;
+    showInfoMessages: boolean;
+    reformatOutput: boolean;
+    switchToOutput: boolean;
+    inlineErrors: boolean;
+};
+
+export interface LanguageSettings {
+    reparseInterval: number;
+    webApiLinks: boolean;
+};
+
+export interface SyncedSettings {
+    compiler: CompilerSettings;
+    language: LanguageSettings;
+    globalIncludePaths?: string[];
+    includePaths?: string[];
+}
+
