@@ -1,6 +1,6 @@
 {
   "name": "pawnforge-lsp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Standalone Language Server Protocol (LSP) for AMX Mod X Pawn (Sublime Text, Notepad++, Neovim, etc.)",
   "main": "dist/server.js",
   "bin": {

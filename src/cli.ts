@@ -4,7 +4,7 @@
  * Compatible with VS Code, Sublime Text, Notepad++, Neovim, and any LSP client.
  */
 
-const version = '1.0.0';
+const version = '1.0.1';
 
 if (process.argv.includes('--version') || process.argv.includes('-v')) {
     console.log(`pawnforge-lsp v${version}`);
